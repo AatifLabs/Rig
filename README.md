@@ -59,7 +59,13 @@ Rig routes your code through ChatGPT's web interface using a browser bridge. No 
 
 ## Install
 
+## Installation
+
 ```bash
+git clone https://github.com/AatifLabs/Rig
+
+cd Rig
+
 pip install -e .
 ```
 
