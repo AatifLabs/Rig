@@ -19,3 +19,8 @@ dependencies = [
 
 [project.scripts]
 rig = "rig.main:main"
+rig-start = "rig.start_bridge:main"
+rig-stop = "rig.stop_bridge:main"
+
+[tool.setuptools]
+packages = ["rig"]
