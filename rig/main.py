@@ -257,6 +257,12 @@ def main():
 
             response = ask_bridge(prompt)
 
+            print("\n" + "=" * 80)
+            print("RAW RESPONSE")
+            print("=" * 80)
+            print(response)
+            print("=" * 80 + "\n")
+
             parsed_files = parse_files(response)
 
             if not parsed_files:
