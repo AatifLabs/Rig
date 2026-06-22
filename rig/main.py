@@ -37,39 +37,108 @@ def main():
             # --------------------
 
             if user_input.startswith("/add "):
-                filenames = user_input.split("/add ", 1)[1].strip().split()
-
                 project_root = Path.cwd()
 
+                # --------------------
+                # /add all
+                # --------------------
+
+                if user_input.strip() == "/add all":
+                    IGNORE_DIRS = {
+                        ".git",
+                        ".venv",
+                        "venv",
+                        "__pycache__",
+                        "node_modules",
+                        "dist",
+                        "build",
+                        ".idea",
+                        ".vscode",
+                    }
+
+                    added = []
+
+                    for file in project_root.rglob("*"):
+                        if not file.is_file():
+                            continue
+
+                        if any(part in IGNORE_DIRS for part in file.parts):
+                            continue
+
+                        rel_path = str(file.relative_to(project_root))
+
+                        if rel_path not in attached_files:
+                            attached_files.append(rel_path)
+                            added.append(rel_path)
+
+                    console.print(f"[green]Attached {len(added)} files.[/green]")
+                    console.print("[cyan]Use /files to inspect attached files.[/cyan]")
+
+                    continue
+
+                # --------------------
+                # normal /add
+                # --------------------
+
+                filenames = user_input.split("/add ", 1)[1].strip().split()
+
+                added = []
+
                 for filename in filenames:
-                    exact_path = project_root / filename
+                    matches = [
+                        match
+                        for match in project_root.rglob(filename)
+                        if match.is_file()
+                    ]
 
-                    if exact_path.exists():
-                        resolved_path = str(exact_path.relative_to(project_root))
+                    if len(matches) == 0:
+                        console.print(f"[red]File not found:[/red] {filename}")
+                        continue
 
-                    else:
-                        matches = list(project_root.rglob(filename))
+                    if len(matches) > 1:
+                        console.print(
+                            f"[red]Multiple matches found for:[/red] {filename}\n"
+                        )
 
-                        if len(matches) == 0:
-                            console.print(f"[red]File not found:[/red] {filename}")
-                            continue
+                        for i, match in enumerate(matches, start=1):
+                            console.print(f"{i}. {match.relative_to(project_root)}")
 
-                        if len(matches) > 1:
-                            console.print(
-                                f"[red]Multiple matches found for:[/red] {filename}"
-                            )
+                        while True:
+                            choice = Prompt.ask(
+                                "[cyan]Select file number (Enter to cancel)[/cyan]",
+                                default="",
+                            ).strip()
 
-                            for match in matches:
-                                console.print(f"  - {match.relative_to(project_root)}")
+                            if choice == "":
+                                break
 
-                            console.print("[yellow]Use full path instead.[/yellow]")
-                            continue
+                            if choice.isdigit() and 1 <= int(choice) <= len(matches):
+                                selected = matches[int(choice) - 1]
 
-                        resolved_path = str(matches[0].relative_to(project_root))
+                                resolved_path = str(selected.relative_to(project_root))
+
+                                if resolved_path not in attached_files:
+                                    attached_files.append(resolved_path)
+                                    added.append(resolved_path)
+
+                                console.print(
+                                    f"[green]Attached:[/green] {resolved_path}"
+                                )
+
+                                break
+
+                            console.print("[red]Invalid selection.[/red]")
+
+                        continue
+
+                    resolved_path = str(matches[0].relative_to(project_root))
 
                     if resolved_path not in attached_files:
                         attached_files.append(resolved_path)
-                        console.print(f"[green]Attached:[/green] {resolved_path}")
+                        added.append(resolved_path)
+
+                if added:
+                    console.print(f"[green]Attached:[/green] {' '.join(added)}")
 
                 continue
 
@@ -84,7 +153,10 @@ def main():
 
                 console.print("\n[cyan]Attached files:[/cyan]")
 
-                for i, file in enumerate(attached_files, start=1):
+                for i, file in enumerate(
+                    attached_files,
+                    start=1,
+                ):
                     console.print(f"{i}. {file}")
 
                 continue
@@ -105,7 +177,10 @@ def main():
             # --------------------
 
             if user_input.startswith("/drop "):
-                target = user_input.split("/drop ", 1)[1].strip()
+                target = user_input.split(
+                    "/drop ",
+                    1,
+                )[1].strip()
 
                 matches = [
                     file
@@ -129,7 +204,10 @@ def main():
             # --------------------
 
             if user_input.startswith("/ask "):
-                question = user_input.split("/ask ", 1)[1].strip()
+                question = user_input.split(
+                    "/ask ",
+                    1,
+                )[1].strip()
 
                 if not question:
                     console.print("[red]Usage: /ask <question>[/red]")
@@ -172,7 +250,10 @@ def main():
 
             project_files = read_attached_files(attached_files)
 
-            prompt = build_prompt(user_input, project_files)
+            prompt = build_prompt(
+                user_input,
+                project_files,
+            )
 
             response = ask_bridge(prompt)
 
@@ -183,7 +264,10 @@ def main():
                 continue
 
             for file in parsed_files:
-                write_file(file["path"], file["content"])
+                write_file(
+                    file["path"],
+                    file["content"],
+                )
 
                 console.print(f"[green]Updated:[/green] {file['path']}")
 
