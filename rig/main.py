@@ -1,13 +1,14 @@
-from pathlib import Path
-
 from rich.console import Console
 from rich.panel import Panel
 from rich.prompt import Prompt
 
 from .bridge_client import ask_bridge
-from .files import read_attached_files, write_file
-from .parser import parse_files
-from .prompt_builder import build_prompt
+from .commands.add import add_files
+from .commands.drop import drop_files
+from .commands.files import show_files
+from .service.file_system import read_attached_files, write_file
+from .service.parser import parse_files
+from .service.prompt_builder import build_prompt
 
 console = Console()
 attached_files = []
@@ -33,170 +34,38 @@ def main():
                 continue
 
             # --------------------
-            # /add
+            # Commands
             # --------------------
 
             if user_input.startswith("/add "):
-                project_root = Path.cwd()
-
-                # --------------------
-                # /add all
-                # --------------------
-
-                if user_input.strip() == "/add all":
-                    IGNORE_DIRS = {
-                        ".git",
-                        ".venv",
-                        "venv",
-                        "__pycache__",
-                        "node_modules",
-                        "dist",
-                        "build",
-                        ".idea",
-                        ".vscode",
-                    }
-
-                    added = []
-
-                    for file in project_root.rglob("*"):
-                        if not file.is_file():
-                            continue
-
-                        if any(part in IGNORE_DIRS for part in file.parts):
-                            continue
-
-                        rel_path = str(file.relative_to(project_root))
-
-                        if rel_path not in attached_files:
-                            attached_files.append(rel_path)
-                            added.append(rel_path)
-
-                    console.print(f"[green]Attached {len(added)} files.[/green]")
-                    console.print("[cyan]Use /files to inspect attached files.[/cyan]")
-
-                    continue
-
-                # --------------------
-                # normal /add
-                # --------------------
-
-                filenames = user_input.split("/add ", 1)[1].strip().split()
-
-                added = []
-
-                for filename in filenames:
-                    matches = [
-                        match
-                        for match in project_root.rglob(filename)
-                        if match.is_file()
-                    ]
-
-                    if len(matches) == 0:
-                        console.print(f"[red]File not found:[/red] {filename}")
-                        continue
-
-                    if len(matches) > 1:
-                        console.print(
-                            f"[red]Multiple matches found for:[/red] {filename}\n"
-                        )
-
-                        for i, match in enumerate(matches, start=1):
-                            console.print(f"{i}. {match.relative_to(project_root)}")
-
-                        while True:
-                            choice = Prompt.ask(
-                                "[cyan]Select file number (Enter to cancel)[/cyan]",
-                                default="",
-                            ).strip()
-
-                            if choice == "":
-                                break
-
-                            if choice.isdigit() and 1 <= int(choice) <= len(matches):
-                                selected = matches[int(choice) - 1]
-
-                                resolved_path = str(selected.relative_to(project_root))
-
-                                if resolved_path not in attached_files:
-                                    attached_files.append(resolved_path)
-                                    added.append(resolved_path)
-
-                                console.print(
-                                    f"[green]Attached:[/green] {resolved_path}"
-                                )
-
-                                break
-
-                            console.print("[red]Invalid selection.[/red]")
-
-                        continue
-
-                    resolved_path = str(matches[0].relative_to(project_root))
-
-                    if resolved_path not in attached_files:
-                        attached_files.append(resolved_path)
-                        added.append(resolved_path)
-
-                if added:
-                    console.print(f"[green]Attached:[/green] {' '.join(added)}")
-
+                add_files(
+                    user_input=user_input,
+                    attached_files=attached_files,
+                    console=console,
+                )
                 continue
-
-            # --------------------
-            # /files
-            # --------------------
 
             if user_input == "/files":
-                if not attached_files:
-                    console.print("[yellow]No files attached.[/yellow]")
-                    continue
-
-                console.print("\n[cyan]Attached files:[/cyan]")
-
-                for i, file in enumerate(
-                    attached_files,
-                    start=1,
-                ):
-                    console.print(f"{i}. {file}")
-
+                show_files(
+                    attached_files=attached_files,
+                    console=console,
+                )
                 continue
-
-            # --------------------
-            # /drop all
-            # --------------------
 
             if user_input == "/drop all":
-                attached_files.clear()
-
-                console.print("[green]All files removed from context.[/green]")
-
+                drop_files(
+                    user_input=user_input,
+                    attached_files=attached_files,
+                    console=console,
+                )
                 continue
 
-            # --------------------
-            # /drop filename
-            # --------------------
-
             if user_input.startswith("/drop "):
-                target = user_input.split(
-                    "/drop ",
-                    1,
-                )[1].strip()
-
-                matches = [
-                    file
-                    for file in attached_files
-                    if file == target or Path(file).name == target
-                ]
-
-                if not matches:
-                    console.print(f"[red]File not attached:[/red] {target}")
-                    continue
-
-                for file in matches:
-                    attached_files.remove(file)
-
-                    console.print(f"[green]Dropped:[/green] {file}")
-
+                drop_files(
+                    user_input=user_input,
+                    attached_files=attached_files,
+                    console=console,
+                )
                 continue
 
             # --------------------
