@@ -69,50 +69,53 @@ async def dynamic_chatgpt_wait(page, max_deadline_ms=600000):
 # EXTRACT RESPONSE (Pure Memory Hijack - No Fallbacks)
 # ============================================================
 
-
 async def extract_latest_response(page):
     try:
         last_message = page.locator('[data-message-author-role="assistant"]').last
-        copy_btns = last_message.locator('button[aria-label="Copy"]')
 
-        count = await copy_btns.count()
+        # Snapshot all copy buttons ONCE
+        buttons = await last_message.locator(
+            'button[aria-label="Copy"]'
+        ).element_handles()
 
-        print(f"-> Found {count} copy button(s)")
+        print(f"-> Found {len(buttons)} copy button(s)")
 
-        if count == 0:
+        if len(buttons) == 0:
             print("-> No code blocks, returning raw text")
             return clean_text(await last_message.inner_text())
 
         all_snippets = []
 
-        for i in range(count):
-            btn = copy_btns.nth(i)
+        for btn in buttons:
             await btn.scroll_into_view_if_needed()
-            await btn.click()
 
-            # Wait for ChatGPT's React app to push to our intercepted variable
-            await asyncio.sleep(0.3)
+            # Clear previous intercepted value
+            await page.evaluate("window._interceptedCode = ''")
 
-            # Read from the intercepted variable directly
+            # Click the stored button
+            await btn.click(force=True)
+
+            # Wait until ChatGPT has written to our hook
+            await page.wait_for_function(
+                "window._interceptedCode.length > 0",
+                timeout=5000,
+            )
+
             code = await page.evaluate("window._interceptedCode")
 
-            # Wipe it clean for the next loop iteration
-            await page.evaluate('window._interceptedCode = "";')
+            if code:
+                all_snippets.append(code)
 
-            if not code:
-                continue
-
-            # NO FALLBACKS. We trust the pure clipboard payload 100%.
-            all_snippets.append(code)
-
-        # Join the pure snippets
         final_text = "\n\n".join(all_snippets)
-        print(f"-> Success: Extracted {len(all_snippets)} pure code blocks")
+
+        print(f"-> Success: Extracted {len(all_snippets)} pure code block(s)")
+
         return clean_text(final_text)
 
     except Exception as e:
         print(f"-> EXTRACTION FAILED: {e}")
         return f"ERROR: {str(e)}"
+
 
 
 # ============================================================

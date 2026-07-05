@@ -2,12 +2,12 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.prompt import Prompt
 
+from ..actions.write import run as write_action
 from ..bridge_client import ask_bridge
 from ..commands.add import add_files
 from ..commands.drop import drop_files
 from ..commands.files import show_files
-from ..service.file_system import read_attached_files, write_file
-from ..service.parser import parse_files
+from ..service.file_system import read_attached_files
 from ..service.prompt_builder import build_prompt
 
 console = Console()
@@ -111,6 +111,10 @@ def run():
 
                 continue
 
+            # --------------------
+            # Code Mode
+            # --------------------
+
             if not attached_files:
                 console.print("[red]No files attached. Use /add filename.py[/red]")
                 continue
@@ -132,19 +136,14 @@ def run():
             print(response)
             print("=" * 80 + "\n")
 
-            parsed_files = parse_files(response)
+            updated_files = write_action(response)
 
-            if not parsed_files:
+            if not updated_files:
                 console.print("[red]No files detected in response[/red]")
                 continue
 
-            for file in parsed_files:
-                write_file(
-                    file["path"],
-                    file["content"],
-                )
-
-                console.print(f"[green]Updated:[/green] {file['path']}")
+            for path in updated_files:
+                console.print(f"[green]Updated:[/green] {path}")
 
         except KeyboardInterrupt:
             console.print("\n[yellow]Goodbye[/yellow]")
