@@ -1,22 +1,46 @@
 import re
 
 
-def parse_files(response: str) -> list[dict]:
-    # Pure regex scissors. No language stripping needed because the payload is pure code.
-    pattern = r"#\s*filename:\s*(\S+?\.py)(.*?)(?=#\s*filename:|\Z)"
-    matches = re.findall(pattern, response, re.DOTALL)
+def clean_payload(content: str) -> str:
+    lines = content.split("\n")
+    non_empty = [line for line in lines if line.strip()]
 
-    files = []
+    if non_empty:
+        min_indent = min(
+            len(line) - len(line.lstrip())
+            for line in non_empty
+        )
+        lines = [line[min_indent:] for line in lines]
 
-    for path, content in matches:
-        # Dedent if everything is over-indented
-        lines = content.split("\n")
-        non_empty = [l for l in lines if l.strip()]
-        if non_empty:
-            min_indent = min(len(l) - len(l.lstrip()) for l in non_empty)
-            lines = [l[min_indent:] for l in lines]
-        content = "\n".join(lines)
+    return "\n".join(lines).strip()
 
-        files.append({"path": path.strip(), "content": content.strip()})
 
-    return files
+def parse_protocols(response: str) -> list[dict]:
+    pattern = (
+        r"^\s*#\s*"
+        r"([a-zA-Z_][a-zA-Z0-9_]*)"   # protocol
+        r"\s*"
+        r"(?:\:\s*(.*?))?"            # optional target
+        r"\s*$"
+        r"(.*?)"
+        r"(?=^\s*#\s*[a-zA-Z_][a-zA-Z0-9_]*\s*(?:\:|\n)|\Z)"
+    )
+
+    matches = re.findall(
+        pattern,
+        response,
+        re.MULTILINE | re.DOTALL,
+    )
+
+    protocols = []
+
+    for protocol, target, payload in matches:
+        protocols.append(
+            {
+                "protocol": protocol.strip().lower(),
+                "target": (target or "").strip(),
+                "payload": clean_payload(payload),
+            }
+        )
+
+    return protocols

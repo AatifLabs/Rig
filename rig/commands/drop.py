@@ -1,38 +1,32 @@
 from pathlib import Path
 
 
+def drop_all(attached_files: list[str]):
+    dropped = attached_files.copy()
+    attached_files.clear()
+    return dropped
+
+
 def drop_files(
-    user_input: str,
+    filenames: list[str],
     attached_files: list[str],
-    console,
 ):
-    # --------------------
-    # /drop all
-    # --------------------
+    dropped = []
+    missing = []
 
-    if user_input == "/drop all":
-        attached_files.clear()
+    for target in filenames:
+        matches = [
+            file
+            for file in attached_files
+            if file == target or Path(file).name == target
+        ]
 
-        console.print("[green]All files removed from context.[/green]")
-        return
+        if not matches:
+            missing.append(target)
+            continue
 
-    # --------------------
-    # /drop filename
-    # --------------------
+        for file in matches:
+            attached_files.remove(file)
+            dropped.append(file)
 
-    target = user_input.split(
-        "/drop ",
-        1,
-    )[1].strip()
-
-    matches = [
-        file for file in attached_files if file == target or Path(file).name == target
-    ]
-
-    if not matches:
-        console.print(f"[red]File not attached:[/red] {target}")
-        return
-
-    for file in matches:
-        attached_files.remove(file)
-        console.print(f"[green]Dropped:[/green] {file}")
+    return dropped, missing
