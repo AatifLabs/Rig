@@ -4,7 +4,7 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.prompt import Prompt
 
-from ..bridge_client import ask_bridge
+from ..bridge_client import ask_bridge, clear_session
 from ..commands.add import (
     add_all,
     add_file,
@@ -98,6 +98,32 @@ def run():
             if user_input == "/code":
                 set_mode("code")
                 console.print("[cyan]Switched to Code mode.[/cyan]")
+                continue
+
+            # --------------------
+            # /clear
+            # --------------------
+            # Resets the browser-side ChatGPT thread via the bridge, so the
+            # next message starts a brand new session instead of continuing
+            # the existing persistent chat.
+            #
+            # NOTE: attached_files is intentionally left untouched here.
+            # /clear only resets the AI conversation state, not Rig's own
+            # file-attachment context. If you want /clear to also drop
+            # attached files, add `attached_files.clear()` below.
+
+            if user_input == "/clear":
+                console.print("[yellow]Clearing session...[/yellow]")
+
+                ok = clear_session()
+
+                if ok:
+                    console.print("[green]Session cleared. Starting fresh.[/green]")
+                else:
+                    console.print(
+                        "[red]Failed to clear session — bridge may be unreachable.[/red]"
+                    )
+
                 continue
 
             # --------------------

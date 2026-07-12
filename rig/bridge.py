@@ -63,9 +63,6 @@ async def dynamic_chatgpt_wait(page, max_deadline_ms=600000):
 
 
 # ============================================================
-# EXTRACT RESPONSE (Pre-Load Memory Hijack)
-# ============================================================
-# ============================================================
 # EXTRACT RESPONSE (Pure Memory Hijack - No Fallbacks)
 # ============================================================
 
@@ -132,9 +129,6 @@ async def get_chatgpt_response(prompt: str):
             print("NEW REQUEST")
             print("======================================\n")
 
-            print("-> Opening fresh chat...")
-            await page.goto(CHATGPT_URL)
-
             prompt_selector = "#prompt-textarea"
             print("-> Waiting for prompt box...")
             await page.wait_for_selector(prompt_selector, timeout=30000)
@@ -167,6 +161,67 @@ async def get_chatgpt_response(prompt: str):
         except Exception as e:
             print("-> MAIN ERROR:", e)
             return f"ERROR: {str(e)}"
+
+
+# ============================================================
+# SESSION RESET (/clear support)
+# ============================================================
+# Used by:
+#   - POST /session/new (below)   <- called by bridge_client.clear_session()
+#   - which is called by /clear in cli.py
+#   - which will later be called by rig-start on boot, and by a TUI button
+#
+# Reuses the same `lock` as get_chatgpt_response() so a clear request
+# queues behind any in-flight generation instead of racing it.
+# ============================================================
+
+
+async def reset_chat_session(page):
+    async with lock:
+        print("\n-> [SESSION] Clearing session, starting new chat...")
+
+        await page.goto(CHATGPT_URL, wait_until="domcontentloaded", timeout=30000)
+
+        # Best-effort click on "New chat" in case goto() lands back inside
+        # a persisted conversation instead of a blank one. Selectors here
+        # are best guesses — ChatGPT's frontend testids drift over time.
+        # If clears stop landing on a truly blank chat, devtools-inspect
+        # the real button and correct this list.
+        candidate_selectors = [
+            '[data-testid="create-new-chat-button"]',
+            'a[href="/"]',
+            'button:has-text("New chat")',
+        ]
+
+        clicked = False
+        for sel in candidate_selectors:
+            try:
+                btn = page.locator(sel).first
+                await btn.click(timeout=500)
+                clicked = True
+                print(f"-> [SESSION] Clicked new-chat via selector: {sel}")
+                break
+            except Exception:
+                continue
+
+        if not clicked:
+            print("-> [SESSION] No new-chat button matched (non-fatal, goto() already did the reset)")
+
+        print("-> [SESSION] Session cleared\n")
+        return True
+
+
+@app.post("/session/new")
+async def new_session():
+    try:
+        ok = await reset_chat_session(page)
+        return JSONResponse(content={"status": "cleared" if ok else "failed"})
+    except Exception as e:
+        print("-> [SESSION] ERROR:", e)
+        return JSONResponse(
+            content={"status": "failed", "error": str(e)},
+            status_code=500,
+        )
 
 
 # ============================================================
