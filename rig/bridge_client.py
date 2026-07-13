@@ -5,10 +5,11 @@ HEALTH_URL = "http://127.0.0.1:8080/health"
 SESSION_URL = "http://127.0.0.1:8080/session/new"
 
 
-def ask_bridge(prompt: str) -> str:
+def ask_bridge(prompt: str, session_id: str) -> str:
     payload = {
         "model": "openai/browser-model",
         "messages": [{"role": "user", "content": prompt}],
+        "session_id": session_id,
     }
     response = requests.post(BRIDGE_URL, json=payload, timeout=600)
     response.raise_for_status()
@@ -25,9 +26,11 @@ def is_bridge_healthy(timeout: float = 5.0) -> bool:
         return False
 
 
-def clear_session(timeout: float = 20.0) -> bool:
+def clear_session(session_id: str, timeout: float = 20.0) -> bool:
     try:
-        response = requests.post(SESSION_URL, timeout=timeout)
+        response = requests.post(
+            SESSION_URL, json={"session_id": session_id}, timeout=timeout
+        )
         response.raise_for_status()
         return response.json().get("status") == "cleared"
     except requests.RequestException as e:

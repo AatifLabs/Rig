@@ -15,7 +15,8 @@ app = FastAPI()
 # ============================================================
 
 browser = None
-page = None
+context = None
+pages: dict[str, "Page"] = {}   # session_id -> Page  ("code", "ask", ...)
 playwright_instance = None
 lock = asyncio.Lock()
 
@@ -114,19 +115,115 @@ async def extract_latest_response(page):
         return f"ERROR: {str(e)}"
 
 
+# ============================================================
+# SESSION LIFECYCLE
+# ============================================================
+# Single source of truth for "give me a blank tab for this session_id".
+#
+#   - session_id not in pages  -> open a brand new tab, nav to ChatGPT,
+#                                  store it. (first-use / lazy creation)
+#   - session_id already in pages -> reuse that same tab, but drive it
+#                                  back to a fresh chat. (/clear)
+#
+# Both /session/new and the lazy-create path inside /v1/chat/completions
+# call this, so there is exactly one code path that creates or resets
+# a session — no duplicated navigation logic.
+# ============================================================
+
+
+async def get_or_create_session(session_id: str):
+    global context
+
+    if session_id in pages:
+        page = pages[session_id]
+        print(f"-> [SESSION:{session_id}] Existing tab found, resetting it...")
+        await _reset_page(page)
+        return page
+
+    print(f"-> [SESSION:{session_id}] No tab yet, creating new one...")
+    page = await context.new_page()
+    await page.goto(CHATGPT_URL, wait_until="domcontentloaded", timeout=30000)
+    pages[session_id] = page
+    print(f"-> [SESSION:{session_id}] Tab created and ready")
+    return page
+
+
+async def _reset_page(page):
+    """
+    Drives an existing tab back to a blank chat. Pulled out of the old
+    reset_chat_session() so both creation and reset share it if needed,
+    but kept as its own function since /clear calls it directly on an
+    already-known page without going through get_or_create_session's
+    branching.
+    """
+    await page.goto(CHATGPT_URL, wait_until="domcontentloaded", timeout=30000)
+
+    # Best-effort click on "New chat" in case goto() lands back inside
+    # a persisted conversation instead of a blank one. Selectors here
+    # are best guesses — ChatGPT's frontend testids drift over time.
+    # If clears stop landing on a truly blank chat, devtools-inspect
+    # the real button and correct this list.
+    candidate_selectors = [
+        '[data-testid="create-new-chat-button"]',
+        'a[href="/"]',
+        'button:has-text("New chat")',
+    ]
+
+    clicked = False
+    for sel in candidate_selectors:
+        try:
+            btn = page.locator(sel).first
+            await btn.click(timeout=500)
+            clicked = True
+            print(f"-> [SESSION] Clicked new-chat via selector: {sel}")
+            break
+        except Exception:
+            continue
+
+    if not clicked:
+        print("-> [SESSION] No new-chat button matched (non-fatal, goto() already did the reset)")
+
+    print("-> [SESSION] Session cleared\n")
+
+
+@app.post("/session/new")
+async def new_session(request: Request):
+    try:
+        body = await request.json()
+        session_id = body.get("session_id", "code")
+
+        async with lock:
+            await get_or_create_session(session_id)
+
+        return JSONResponse(content={"status": "cleared", "session_id": session_id})
+    except Exception as e:
+        print("-> [SESSION] ERROR:", e)
+        return JSONResponse(
+            content={"status": "failed", "error": str(e)},
+            status_code=500,
+        )
+
 
 # ============================================================
 # MAIN GPT REQUEST
 # ============================================================
 
 
-async def get_chatgpt_response(prompt: str):
-    global page
-
+async def get_chatgpt_response(prompt: str, session_id: str):
     async with lock:
         try:
+            if session_id not in pages:
+                # Lazy creation happens here, still inside the lock, so a
+                # request can't race /session/new for the same session_id.
+                print(f"-> [SESSION:{session_id}] Not found, lazily creating...")
+                page = await context.new_page()
+                await page.goto(CHATGPT_URL, wait_until="domcontentloaded", timeout=30000)
+                pages[session_id] = page
+            else:
+                page = pages[session_id]
+
             print("\n======================================")
-            print("NEW REQUEST")
+            print(f"NEW REQUEST [session={session_id}]")
             print("======================================\n")
 
             prompt_selector = "#prompt-textarea"
@@ -161,67 +258,6 @@ async def get_chatgpt_response(prompt: str):
         except Exception as e:
             print("-> MAIN ERROR:", e)
             return f"ERROR: {str(e)}"
-
-
-# ============================================================
-# SESSION RESET (/clear support)
-# ============================================================
-# Used by:
-#   - POST /session/new (below)   <- called by bridge_client.clear_session()
-#   - which is called by /clear in cli.py
-#   - which will later be called by rig-start on boot, and by a TUI button
-#
-# Reuses the same `lock` as get_chatgpt_response() so a clear request
-# queues behind any in-flight generation instead of racing it.
-# ============================================================
-
-
-async def reset_chat_session(page):
-    async with lock:
-        print("\n-> [SESSION] Clearing session, starting new chat...")
-
-        await page.goto(CHATGPT_URL, wait_until="domcontentloaded", timeout=30000)
-
-        # Best-effort click on "New chat" in case goto() lands back inside
-        # a persisted conversation instead of a blank one. Selectors here
-        # are best guesses — ChatGPT's frontend testids drift over time.
-        # If clears stop landing on a truly blank chat, devtools-inspect
-        # the real button and correct this list.
-        candidate_selectors = [
-            '[data-testid="create-new-chat-button"]',
-            'a[href="/"]',
-            'button:has-text("New chat")',
-        ]
-
-        clicked = False
-        for sel in candidate_selectors:
-            try:
-                btn = page.locator(sel).first
-                await btn.click(timeout=500)
-                clicked = True
-                print(f"-> [SESSION] Clicked new-chat via selector: {sel}")
-                break
-            except Exception:
-                continue
-
-        if not clicked:
-            print("-> [SESSION] No new-chat button matched (non-fatal, goto() already did the reset)")
-
-        print("-> [SESSION] Session cleared\n")
-        return True
-
-
-@app.post("/session/new")
-async def new_session():
-    try:
-        ok = await reset_chat_session(page)
-        return JSONResponse(content={"status": "cleared" if ok else "failed"})
-    except Exception as e:
-        print("-> [SESSION] ERROR:", e)
-        return JSONResponse(
-            content={"status": "failed", "error": str(e)},
-            status_code=500,
-        )
 
 
 # ============================================================
@@ -263,6 +299,7 @@ async def chat_completions(request: Request):
     try:
         body = await request.json()
         messages = body.get("messages", [])
+        session_id = body.get("session_id", "code")
         prompt_parts = []
 
         for msg in messages:
@@ -286,10 +323,10 @@ async def chat_completions(request: Request):
         model_name = body.get("model", "openai/browser-model")
 
         print("\n======================================")
-        print("REQUEST FROM AIDER")
+        print(f"REQUEST FROM CLIENT [session={session_id}]")
         print("======================================\n")
 
-        reply_text = await get_chatgpt_response(prompt)
+        reply_text = await get_chatgpt_response(prompt, session_id)
         reply_text = clean_text(reply_text)
 
         if not reply_text:
@@ -346,7 +383,7 @@ async def chat_completions(request: Request):
 
 
 async def setup_browser():
-    global browser, page, playwright_instance
+    global browser, context, playwright_instance
 
     print("-> Connecting to Chrome...")
     playwright_instance = await async_playwright().start()
@@ -355,13 +392,15 @@ async def setup_browser():
     )
 
     context = browser.contexts[0] if browser.contexts else await browser.new_context()
-    page = context.pages[0] if context.pages else await context.new_page()
 
     # ============================================================
     # THE IRONCLAD HIJACK
-    # Overwrite the clipboard API globally before ChatGPT loads
+    # Overwrite the clipboard API globally before ChatGPT loads.
+    # Moved to context-level so it auto-applies to every future tab
+    # we open for new sessions, not just the first page. Snapshot /
+    # click-order logic inside extract_latest_response() is untouched.
     # ============================================================
-    await page.add_init_script("""
+    await context.add_init_script("""
         window._interceptedCode = "";
 
         Object.defineProperty(navigator, 'clipboard', {
@@ -379,11 +418,13 @@ async def setup_browser():
         });
     """)
 
-    print("-> Navigating to ChatGPT...")
-    await page.goto(
-        "https://chatgpt.com/", wait_until="domcontentloaded", timeout=30000
-    )
-    print("-> ChatGPT loaded")
+    # Eager creation of the "code" session on boot. Intentional health
+    # check / debugging aid: if this tab opens successfully we know the
+    # browser connected and the bridge is healthy before any prompt is
+    # ever sent. The "ask" session is NOT created here — it's created
+    # lazily on its first request, inside get_chatgpt_response().
+    print("-> Opening initial 'code' session...")
+    await get_or_create_session("code")
     print("-> Browser ready")
 
 
@@ -408,9 +449,9 @@ async def shutdown_event():
 @app.get("/health")
 async def health():
     try:
-        global page
+        page = pages.get("code")
         if not page:
-            return {"status": "dead", "reason": "page_not_initialized"}
+            return {"status": "dead", "reason": "code_session_not_initialized"}
         if "chatgpt.com" not in page.url:
             return {"status": "dead", "reason": f"wrong_url: {page.url}"}
         await page.wait_for_selector("#prompt-textarea", timeout=10000)

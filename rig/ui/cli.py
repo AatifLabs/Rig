@@ -32,6 +32,16 @@ from ..service.validator import validate
 console = Console()
 attached_files = []
 
+# Tracks whether each mode's session has already received its system
+# prompt. "code" starts True because bridge.py eagerly creates and the
+# first turn in code mode still needs to send the prompt once — so this
+# starts False for both; only rig-start's browser-tab creation is eager,
+# not the system-prompt send. The prompt is sent on first USE, not boot.
+sessions_initialized = {
+    "code": False,
+    "ask": False,
+}
+
 
 def prompt_label() -> str:
     return "Ask" if get_mode() == "ask" else "Rig"
@@ -73,21 +83,24 @@ def handle_protocol(protocol: dict):
 
 def run_ai_turn(prompt: str):
     """
-    Sends `prompt` to the AI, processes every protocol in the response,
-    and — if any dispatched protocol has continuity=True — automatically
-    feeds those results back to the AI as the next turn, without waiting
-    for the human. Recurses until a turn produces no continuity=True
-    protocols, at which point control returns to the human prompt loop.
+    Sends `prompt` to the AI (in whatever mode/session is currently
+    active), processes every protocol in the response, and — if any
+    dispatched protocol has continuity=True — automatically feeds those
+    results back to the AI as the next turn, without waiting for the
+    human. Recurses until a turn produces no continuity=True protocols,
+    at which point control returns to the human prompt loop.
 
-    NOTE ON FEEDBACK FORMAT: when auto-continuing, each continuity=True
-    result is sent back as a plain "[protocol_name result]\\n<result>"
-    block. This is a first-pass format — flag if you want it shaped
-    differently (e.g. matching the #protocol: syntax the AI itself uses).
+    Every call — including this recursive follow-up — targets the same
+    session_id (the mode active when the turn started), and never
+    re-sends the system prompt, since by definition the session was
+    already initialized to get here.
     """
+
+    session_id = get_mode()
 
     console.print("\n[yellow]Sending to AI Bridge...[/yellow]\n")
 
-    response = ask_bridge(prompt)
+    response = ask_bridge(prompt, session_id=session_id)
 
     protocols = parse_protocols(response)
 
@@ -132,6 +145,10 @@ def run():
             # --------------------
             # /ask, /code (mode switching)
             # --------------------
+            # Pure pointer switch. No network call, no reset, no system
+            # prompt sent here — that only happens lazily on the next
+            # actual turn if this mode's session hasn't been initialized
+            # yet (see sessions_initialized below).
 
             if user_input == "/ask":
                 set_mode("ask")
@@ -146,9 +163,10 @@ def run():
             # --------------------
             # /clear
             # --------------------
-            # Resets the browser-side ChatGPT thread via the bridge, so the
-            # next message starts a brand new session instead of continuing
-            # the existing persistent chat.
+            # Resets ONLY the current mode's session on the bridge side,
+            # and marks it uninitialized so the next turn in this mode
+            # sends the system prompt fresh again. The other mode's
+            # session is completely untouched.
             #
             # NOTE: attached_files is intentionally left untouched here.
             # /clear only resets the AI conversation state, not Rig's own
@@ -156,11 +174,13 @@ def run():
             # attached files, add `attached_files.clear()` below.
 
             if user_input == "/clear":
-                console.print("[yellow]Clearing session...[/yellow]")
+                session_id = get_mode()
+                console.print(f"[yellow]Clearing {session_id} session...[/yellow]")
 
-                ok = clear_session()
+                ok = clear_session(session_id=session_id)
 
                 if ok:
+                    sessions_initialized[session_id] = False
                     console.print("[green]Session cleared. Starting fresh.[/green]")
                 else:
                     console.print(
@@ -287,11 +307,15 @@ def run():
             # --------------------
             # New execution pipeline
             # build_prompt -> ask_bridge -> parse_protocols -> validate -> dispatch
-            # Auto-continuation for continuity=True protocols happens inside
-            # run_ai_turn(); control only returns here once a turn produces
-            # no continuity=True protocols (or none at all).
-            # /add is optional: empty attached_files is fine.
+            #
+            # System prompt is included only if this mode's session has
+            # not been initialized yet. After sending, it's marked
+            # initialized so subsequent turns in this mode never resend
+            # it — until /clear flips it back to False.
             # --------------------
+
+            session_id = get_mode()
+            include_system_prompt = not sessions_initialized[session_id]
 
             project_files = read_attached_files(attached_files) if attached_files else []
 
@@ -299,7 +323,11 @@ def run():
                 get_prompt(),
                 user_input,
                 project_files,
+                include_system_prompt=include_system_prompt,
             )
+
+            if include_system_prompt:
+                sessions_initialized[session_id] = True
 
             run_ai_turn(prompt)
 
