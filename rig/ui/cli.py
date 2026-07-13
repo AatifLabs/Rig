@@ -40,18 +40,20 @@ def prompt_label() -> str:
 def handle_protocol(protocol: dict):
     """
     Validate, dispatch and display a single parsed protocol.
+    Returns the dispatch result dict (or None if it wasn't dispatched),
+    so callers can inspect "continuity" afterward.
     """
 
     if not protocol_exists(protocol["protocol"]):
         console.print(f"[red]Unknown protocol:[/red] {protocol['protocol']}")
-        return
+        return None
 
     if not validate(protocol):
         console.print(
             f"[red]Protocol not permitted in {get_mode()} mode:[/red] "
             f"{protocol['protocol']}"
         )
-        return
+        return None
 
     result = dispatch(protocol)
 
@@ -65,6 +67,47 @@ def handle_protocol(protocol: dict):
                 border_style="cyan",
             )
         )
+
+    return result
+
+
+def run_ai_turn(prompt: str):
+    """
+    Sends `prompt` to the AI, processes every protocol in the response,
+    and — if any dispatched protocol has continuity=True — automatically
+    feeds those results back to the AI as the next turn, without waiting
+    for the human. Recurses until a turn produces no continuity=True
+    protocols, at which point control returns to the human prompt loop.
+
+    NOTE ON FEEDBACK FORMAT: when auto-continuing, each continuity=True
+    result is sent back as a plain "[protocol_name result]\\n<result>"
+    block. This is a first-pass format — flag if you want it shaped
+    differently (e.g. matching the #protocol: syntax the AI itself uses).
+    """
+
+    console.print("\n[yellow]Sending to AI Bridge...[/yellow]\n")
+
+    response = ask_bridge(prompt)
+
+    protocols = parse_protocols(response)
+
+    if not protocols:
+        console.print("[red]No protocol detected.[/red]")
+        return
+
+    continuity_results = []
+
+    for protocol in protocols:
+        result = handle_protocol(protocol)
+
+        if result is not None and result.get("continuity"):
+            continuity_results.append(
+                f"[{result['protocol']} result]\n{result['result']}"
+            )
+
+    if continuity_results:
+        followup_prompt = "\n\n".join(continuity_results)
+        run_ai_turn(followup_prompt)
 
 
 def run():
@@ -244,6 +287,9 @@ def run():
             # --------------------
             # New execution pipeline
             # build_prompt -> ask_bridge -> parse_protocols -> validate -> dispatch
+            # Auto-continuation for continuity=True protocols happens inside
+            # run_ai_turn(); control only returns here once a turn produces
+            # no continuity=True protocols (or none at all).
             # /add is optional: empty attached_files is fine.
             # --------------------
 
@@ -255,18 +301,7 @@ def run():
                 project_files,
             )
 
-            console.print("\n[yellow]Sending to AI Bridge...[/yellow]\n")
-
-            response = ask_bridge(prompt)
-
-            protocols = parse_protocols(response)
-
-            if not protocols:
-                console.print("[red]No protocol detected.[/red]")
-                continue
-
-            for protocol in protocols:
-                handle_protocol(protocol)
+            run_ai_turn(prompt)
 
         except KeyboardInterrupt:
             console.print("\n[yellow]Goodbye[/yellow]")

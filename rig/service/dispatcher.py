@@ -1,4 +1,4 @@
-from ..protocol.registry import get
+from ..protocol.registry import get, get_continuity
 
 
 def dispatch(protocol: dict):
@@ -13,4 +13,5 @@ def dispatch(protocol: dict):
         "kind": entry["kind"],
         "protocol": protocol["protocol"],
         "result": entry["handler"](protocol),
+        "continuity": get_continuity(protocol["protocol"]),
     }

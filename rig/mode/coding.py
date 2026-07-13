@@ -18,7 +18,9 @@ Rules:
     #ask
     content
 
-- #ask use it for
+    #read:filename.extention filename.extention filename.extention
+-for read u will get back the requested files
+- use #ask to text the human, without protocol your text wont reach human
 - #write always replaces the entire file. Never output partial files. If you want to append or modify something, regenerate the complete file."
 """
 
@@ -27,5 +29,5 @@ ALLOWED_ACTIONS = [
 ]
 
 ALLOWED_RESPONSES = [
-    "ask",
+    "ask","read"
 ]
