@@ -4,6 +4,7 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.prompt import Prompt
 
+from ..service.project_map import generate_project_map
 from ..bridge_client import ask_bridge, clear_session
 from ..commands.add import (
     add_all,
@@ -31,6 +32,7 @@ from ..service.validator import validate
 
 console = Console()
 attached_files = []
+pending_context = None
 
 # Tracks whether each mode's session has already received its system
 # prompt. "code" starts True because bridge.py eagerly creates and the
@@ -124,6 +126,8 @@ def run_ai_turn(prompt: str):
 
 
 def run():
+    global pending_context
+
     console.print(
         Panel(
             "[bold cyan]Rig v0.1[/bold cyan]",
@@ -305,13 +309,36 @@ def run():
                 continue
 
             # --------------------
+            # /projectmap
+            # --------------------
+            # One-shot context injection. Generates the map immediately,
+            # stores it in `pending_context`, and does NOT talk to the AI.
+            # It rides along with the *next* user prompt only, then is
+            # cleared — nothing persists, nothing touches attached_files,
+            # nothing is written to disk.
+
+            if user_input == "/projectmap" or user_input.startswith("/projectmap "):
+                target = user_input[len("/projectmap"):].strip()
+                root = Path(target) if target else Path.cwd()
+
+                if not root.exists():
+                    console.print(f"[red]Path not found:[/red] {target}")
+                    continue
+
+                console.print("[yellow]Generating project map...[/yellow]")
+
+                pending_context = generate_project_map(root)
+
+                console.print(
+                    "[green]Project map ready — it will be included with your "
+                    "next message only.[/green]"
+                )
+
+                continue
+
+# --------------------
             # New execution pipeline
             # build_prompt -> ask_bridge -> parse_protocols -> validate -> dispatch
-            #
-            # System prompt is included only if this mode's session has
-            # not been initialized yet. After sending, it's marked
-            # initialized so subsequent turns in this mode never resend
-            # it — until /clear flips it back to False.
             # --------------------
 
             session_id = get_mode()
@@ -324,7 +351,10 @@ def run():
                 user_input,
                 project_files,
                 include_system_prompt=include_system_prompt,
+                pending_context=pending_context,
             )
+
+            pending_context = None  # cleared before send, never survives past this point
 
             if include_system_prompt:
                 sessions_initialized[session_id] = True

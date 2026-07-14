@@ -1,6 +1,7 @@
 from ..actions import write
 from ..response import ask
 from ..response import read
+from ..response import projectmap
 
 PROTOCOLS = {
     "write": {
@@ -18,6 +19,12 @@ PROTOCOLS = {
         "handler": read.run,
         "continuity": True,
     },
+    "projectmap": {
+            "kind": "response",
+            "handler": projectmap.run,
+            "continuity": True,
+    },
+
 }
 
 

@@ -29,5 +29,5 @@ ALLOWED_ACTIONS = [
 ]
 
 ALLOWED_RESPONSES = [
-    "ask","read"
+    "ask","read","projectmap"
 ]

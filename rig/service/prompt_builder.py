@@ -3,6 +3,7 @@ def build_prompt(
     user_request: str,
     project_files: list[dict],
     include_system_prompt: bool = True,
+    pending_context: str = None,
 ):
     sections = []
 
@@ -37,6 +38,15 @@ def build_prompt(
             "ATTACHED FILES",
             "================",
             "\n\n".join(file_blocks),
+            "================",
+        ]
+
+    if pending_context:
+        sections += [
+            "",
+            "PROJECT MAP (one-shot — not attached, will not repeat)",
+            "================",
+            pending_context,
             "================",
         ]
 
