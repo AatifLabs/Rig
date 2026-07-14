@@ -9,7 +9,7 @@ def build_prompt(
 
     if include_system_prompt:
         sections += [
-            "SYSTEM PROMPT",
+            "SESSION PROTOCOL",
             "================",
             system_prompt,
             "================",

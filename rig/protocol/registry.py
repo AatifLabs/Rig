@@ -1,5 +1,5 @@
 from ..actions import write
-from ..response import ask
+from ..response import chat
 from ..response import read
 from ..response import projectmap
 
@@ -9,9 +9,9 @@ PROTOCOLS = {
         "handler": write.run,
         "continuity": False,
     },
-    "ask": {
+    "chat": {
         "kind": "response",
-        "handler": ask.run,
+        "handler": chat.run,
         "continuity": False,
     },
     "read": {
