@@ -13,7 +13,12 @@ def read_attached_files(paths):
 
 
 def write_file(path, content):
-    Path(path).write_text(content)
+    file_path = Path(path)
+
+    # Create parent directories if needed.
+    file_path.parent.mkdir(parents=True, exist_ok=True)
+
+    file_path.write_text(content)
 
 
 def read_files(paths):

@@ -31,7 +31,7 @@ the IDE will read and send back the content you have requested for in the next m
 
 write can create new files too.
 write only after u understand what to do. dont misunderstand the context since the action are irreversable.
-write cant create folder, ask user to create folder if needed.
+Write creates missing parent directories automatically when writing a file. It does not support standalone folder creation.
 use this when u wanted to write a content into taht file. only genearte whole code instead of partial as there is no search and replace. so dont say here is the remainng code
 
 #projectmap:
