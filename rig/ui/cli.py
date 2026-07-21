@@ -2,7 +2,13 @@ from pathlib import Path
 
 from rich.console import Console
 from rich.panel import Panel
-from rich.prompt import Prompt
+from rich.table import Table
+from rich.text import Text
+
+from prompt_toolkit import PromptSession
+from prompt_toolkit.completion import Completer, Completion
+from prompt_toolkit.formatted_text import HTML
+from prompt_toolkit.history import InMemoryHistory
 
 from ..service.project_map import generate_project_map
 from ..bridge_client import ask_bridge, clear_session
@@ -34,6 +40,8 @@ console = Console()
 attached_files = []
 pending_context = None
 
+VERSION = "1.2"
+
 # Tracks whether each mode's session has already received its system
 # prompt. "code" starts True because bridge.py eagerly creates and the
 # first turn in code mode still needs to send the prompt once — so this
@@ -44,9 +52,137 @@ sessions_initialized = {
     "ask": False,
 }
 
+# --------------------
+# Command metadata — single source of truth for /help and autocomplete
+# --------------------
+COMMANDS = [
+    ("/help", "Show all available commands"),
+    ("/ask", "Switch to Ask mode (read-only session)"),
+    ("/code", "Switch to Code mode (file writes allowed)"),
+    ("/clear", "Reset the current mode's AI session"),
+    ("/add", "Attach a file to context — /add <filename>"),
+    ("/add all", "Attach every discoverable file to context"),
+    ("/files", "List currently attached files"),
+    ("/drop", "Remove a file from context — /drop <filename>"),
+    ("/drop all", "Remove all attached files from context"),
+    ("/projectmap", "Generate a project map for the next message only"),
+    ("exit", "Exit Rig"),
+    ("quit", "Exit Rig"),
+]
+
+# Status message + icon shown while a protocol is being dispatched /
+# rendered. Falls back to a generic entry if a protocol isn't listed.
+PROTOCOL_UI = {
+    "read": {"status": "Reading files...", "icon": "📖"},
+    "write": {"status": "Writing changes...", "icon": "✍️"},
+    "grep": {"status": "Searching codebase...", "icon": "🔍"},
+    "terminal": {"status": "Executing command...", "icon": "💻"},
+    "gitdiff": {"status": "Computing diff...", "icon": "🔀"},
+    "projectmap": {"status": "Mapping project...", "icon": "🗺️"},
+    "chat": {"status": "Thinking...", "icon": "💬"},
+    "askuser": {"status": "Waiting on input...", "icon": "❓"},
+}
+DEFAULT_PROTOCOL_UI = {"status": "Processing...", "icon": "⚙️"}
+
+
+class CommandCompleter(Completer):
+    """
+    Popup autocomplete for slash-commands (and bare exit/quit). Only
+    activates once the user starts typing "/" — mirrors typing "/" in
+    Slack/Discord-style command palettes.
+    """
+
+    def get_completions(self, document, complete_event):
+        text = document.text_before_cursor
+
+        if text == "" or text.startswith("/"):
+            for cmd, desc in COMMANDS:
+                if cmd.startswith(text):
+                    yield Completion(
+                        cmd[len(text):],
+                        start_position=0,
+                        display=cmd,
+                        display_meta=desc,
+                    )
+
+
+prompt_session = PromptSession(
+    history=InMemoryHistory(),
+    completer=CommandCompleter(),
+    complete_while_typing=True,
+)
+
 
 def prompt_label() -> str:
     return "Ask" if get_mode() == "ask" else "Rig"
+
+
+def print_banner():
+    console.print(
+        Panel(
+            f"[bold cyan]Rig v{VERSION}[/bold cyan]  "
+            f"[dim]mode: {get_mode()}[/dim]",
+            border_style="cyan",
+        )
+    )
+
+
+def print_help():
+    table = Table(title=f"Rig v{VERSION} — Commands", border_style="cyan")
+    table.add_column("Command", style="bold cyan", no_wrap=True)
+    table.add_column("Description", style="white")
+
+    for cmd, desc in COMMANDS:
+        table.add_row(cmd, desc)
+
+    console.print(table)
+    console.print(
+        "[dim]Type[/dim] [cyan]/[/cyan] [dim]at any prompt to see a live "
+        "command popup as you type.[/dim]"
+    )
+
+
+def print_error(title: str, message: str):
+    console.print(
+        Panel(
+            message,
+            title=f"[bold red]{title}[/bold red]",
+            border_style="red",
+        )
+    )
+
+
+def is_diff_like(text: str) -> bool:
+    lines = text.splitlines()
+    return any(
+        line.startswith(("+++", "---", "@@", "+", "-"))
+        for line in lines
+    )
+
+
+def render_diff(text: str) -> Text:
+    """
+    Colorizes unified-diff-style output line by line: additions green,
+    removals red, hunk headers cyan, everything else dim default.
+    """
+
+    rendered = Text()
+
+    for line in text.splitlines():
+        if line.startswith(("+++", "---")):
+            style = "bold cyan"
+        elif line.startswith("@@"):
+            style = "cyan"
+        elif line.startswith("+"):
+            style = "green"
+        elif line.startswith("-"):
+            style = "red"
+        else:
+            style = "white"
+
+        rendered.append(line + "\n", style=style)
+
+    return rendered
 
 
 def handle_protocol(protocol: dict):
@@ -56,26 +192,38 @@ def handle_protocol(protocol: dict):
     so callers can inspect "continuity" afterward.
     """
 
-    if not protocol_exists(protocol["protocol"]):
-        console.print(f"[red]Unknown protocol:[/red] {protocol['protocol']}")
+    name = protocol["protocol"]
+    ui = PROTOCOL_UI.get(name, DEFAULT_PROTOCOL_UI)
+
+    if not protocol_exists(name):
+        print_error("Unknown Protocol", f"'{name}' is not a recognized protocol.")
         return None
 
     if not validate(protocol):
-        console.print(
-            f"[red]Protocol not permitted in {get_mode()} mode:[/red] "
-            f"{protocol['protocol']}"
+        print_error(
+            "Protocol Not Permitted",
+            f"'{name}' is not allowed in [bold]{get_mode()}[/bold] mode.",
         )
         return None
 
-    result = dispatch(protocol)
+    with console.status(f"[cyan]{ui['status']}[/cyan]", spinner="dots"):
+        result = dispatch(protocol)
 
     if result["kind"] == "action":
-        console.print(f"[green]Updated:[/green] {result['result']}")
+        console.print(f"[green]✔ Updated:[/green] {result['result']}")
     else:
+        result_text = result["result"]
+
+        body = (
+            render_diff(result_text)
+            if is_diff_like(result_text)
+            else result_text
+        )
+
         console.print(
             Panel(
-                result["result"],
-                title=f"[cyan]{result['protocol'].capitalize()}[/cyan]",
+                body,
+                title=f"{ui['icon']} [cyan]{result['protocol'].capitalize()}[/cyan]",
                 border_style="cyan",
             )
         )
@@ -100,14 +248,13 @@ def run_ai_turn(prompt: str):
 
     session_id = get_mode()
 
-    console.print("\n[yellow]Sending to AI Bridge...[/yellow]\n")
-
-    response = ask_bridge(prompt, session_id=session_id)
+    with console.status("[yellow]Sending to AI Bridge...[/yellow]", spinner="dots"):
+        response = ask_bridge(prompt, session_id=session_id)
 
     protocols = parse_protocols(response)
 
     if not protocols:
-        console.print("[red]No protocol detected.[/red]")
+        print_error("No Protocol Detected", "The AI response contained no parseable protocol.")
         return
 
     continuity_results = []
@@ -128,22 +275,27 @@ def run_ai_turn(prompt: str):
 def run():
     global pending_context
 
-    console.print(
-        Panel(
-            "[bold cyan]Rig v0.1[/bold cyan]",
-            border_style="cyan",
-        )
-    )
+    print_banner()
 
     while True:
         try:
-            user_input = Prompt.ask(f"[bold cyan]{prompt_label()}[/bold cyan]").strip()
+            user_input = prompt_session.prompt(
+                HTML(f"<ansicyan><b>{prompt_label()}</b></ansicyan> ")
+            ).strip()
 
             if user_input.lower() in ["exit", "quit"]:
                 console.print("\n[yellow]Goodbye[/yellow]")
                 break
 
             if not user_input:
+                continue
+
+            # --------------------
+            # /help
+            # --------------------
+
+            if user_input == "/help":
+                print_help()
                 continue
 
             # --------------------
@@ -179,16 +331,17 @@ def run():
 
             if user_input == "/clear":
                 session_id = get_mode()
-                console.print(f"[yellow]Clearing {session_id} session...[/yellow]")
 
-                ok = clear_session(session_id=session_id)
+                with console.status(f"[yellow]Clearing {session_id} session...[/yellow]", spinner="dots"):
+                    ok = clear_session(session_id=session_id)
 
                 if ok:
                     sessions_initialized[session_id] = False
-                    console.print("[green]Session cleared. Starting fresh.[/green]")
+                    console.print("[green]✔ Session cleared. Starting fresh.[/green]")
                 else:
-                    console.print(
-                        "[red]Failed to clear session — bridge may be unreachable.[/red]"
+                    print_error(
+                        "Session Clear Failed",
+                        "Could not clear the session — the bridge may be unreachable.",
                     )
 
                 continue
@@ -201,7 +354,7 @@ def run():
                 if user_input.strip() == "/add all":
                     added = add_all(attached_files)
 
-                    console.print(f"[green]Attached {len(added)} files.[/green]")
+                    console.print(f"[green]✔ Attached {len(added)} files.[/green]")
                     console.print("[cyan]Use /files to inspect attached files.[/cyan]")
 
                     continue
@@ -214,21 +367,20 @@ def run():
                     matches = add_file(filename)
 
                     if len(matches) == 0:
-                        console.print(f"[red]File not found:[/red] {filename}")
+                        print_error("File Not Found", filename)
                         continue
 
                     if len(matches) > 1:
                         console.print(
-                            f"[red]Multiple matches found for:[/red] {filename}\n"
+                            f"[yellow]Multiple matches found for:[/yellow] {filename}\n"
                         )
 
                         for i, match in enumerate(matches, start=1):
                             console.print(f"{i}. {match.relative_to(Path.cwd())}")
 
                         while True:
-                            choice = Prompt.ask(
-                                "[cyan]Select file number (Enter to cancel)[/cyan]",
-                                default="",
+                            choice = prompt_session.prompt(
+                                HTML("<ansicyan>Select file number (Enter to cancel)</ansicyan> ")
                             ).strip()
 
                             if choice == "":
@@ -243,12 +395,12 @@ def run():
                                 if attached:
                                     added.append(attached)
                                     console.print(
-                                        f"[green]Attached:[/green] {attached}"
+                                        f"[green]✔ Attached:[/green] {attached}"
                                     )
 
                                 break
 
-                            console.print("[red]Invalid selection.[/red]")
+                            print_error("Invalid Selection", "Please enter a valid number.")
 
                         continue
 
@@ -261,7 +413,7 @@ def run():
                         added.append(attached)
 
                 if added:
-                    console.print(f"[green]Attached:[/green] {' '.join(added)}")
+                    console.print(f"[green]✔ Attached:[/green] {' '.join(added)}")
 
                 continue
 
@@ -289,7 +441,7 @@ def run():
             if user_input == "/drop all":
                 drop_all(attached_files)
 
-                console.print("[green]All files removed from context.[/green]")
+                console.print("[green]✔ All files removed from context.[/green]")
                 continue
 
             if user_input.startswith("/drop "):
@@ -301,10 +453,10 @@ def run():
                 )
 
                 for file in dropped:
-                    console.print(f"[green]Dropped:[/green] {file}")
+                    console.print(f"[green]✔ Dropped:[/green] {file}")
 
                 for file in missing:
-                    console.print(f"[red]File not attached:[/red] {file}")
+                    print_error("File Not Attached", file)
 
                 continue
 
@@ -322,21 +474,20 @@ def run():
                 root = Path(target) if target else Path.cwd()
 
                 if not root.exists():
-                    console.print(f"[red]Path not found:[/red] {target}")
+                    print_error("Path Not Found", target)
                     continue
 
-                console.print("[yellow]Generating project map...[/yellow]")
-
-                pending_context = generate_project_map(root)
+                with console.status("[cyan]Mapping project...[/cyan]", spinner="dots"):
+                    pending_context = generate_project_map(root)
 
                 console.print(
-                    "[green]Project map ready — it will be included with your "
-                    "next message only.[/green]"
+                    "[green]✔ Project map ready[/green] — it will be included "
+                    "with your next message only."
                 )
 
                 continue
 
-# --------------------
+            # --------------------
             # New execution pipeline
             # build_prompt -> ask_bridge -> parse_protocols -> validate -> dispatch
             # --------------------
@@ -365,5 +516,9 @@ def run():
             console.print("\n[yellow]Goodbye[/yellow]")
             break
 
+        except EOFError:
+            console.print("\n[yellow]Goodbye[/yellow]")
+            break
+
         except Exception as e:
-            console.print(f"\n[red]Error:[/red] {e}\n")
+            print_error(type(e).__name__, str(e))
