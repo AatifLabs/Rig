@@ -7,7 +7,8 @@ PROTOCOLS = {
     "write": {
         "kind": "action",
         "handler": write.run,
-        "continuity": False,
+        "continuity": True,
+        "confirmation": True,
     },
     "chat": {
         "kind": "response",
@@ -20,11 +21,10 @@ PROTOCOLS = {
         "continuity": True,
     },
     "projectmap": {
-            "kind": "response",
-            "handler": projectmap.run,
-            "continuity": True,
+        "kind": "response",
+        "handler": projectmap.run,
+        "continuity": True,
     },
-
 }
 
 
@@ -37,13 +37,18 @@ def exists(protocol: str) -> bool:
 
 
 def get_continuity(protocol: str) -> bool:
-    """
-    Returns the continuity flag for a protocol.
-    Defaults to False if the protocol is unknown OR if the
-    protocol entry simply never set "continuity" at all —
-    absence of the key is treated identically to explicit False.
-    """
     entry = PROTOCOLS.get(protocol)
     if entry is None:
         return False
     return entry.get("continuity", False)
+
+
+def get_confirmation(protocol: str) -> bool:
+    """
+    Returns the confirmation flag for a protocol. Defaults to False —
+    absence of the key means no human gate before the handler runs.
+    """
+    entry = PROTOCOLS.get(protocol)
+    if entry is None:
+        return False
+    return entry.get("confirmation", False)

@@ -30,6 +30,7 @@ the IDE will read and send back the content you have requested for in the next m
 <content>
 
 write can create new files too.
+after a write, either sucessful or failure, u will get the result.
 write only after u understand what to do. dont misunderstand the context since the action are irreversable.
 Write creates missing parent directories automatically when writing a file. It does not support standalone folder creation.
 use this when u wanted to write a content into taht file. only genearte whole code instead of partial as there is no search and replace. so dont say here is the remainng code
@@ -58,8 +59,7 @@ and then write
 
 LOOP on writing :
 
-For long coding tasks, use the write/read loop as a continuation mechanism to overcome token limits: write complete file outputs when they fit, then read updated files
-and continue until the implementation is finished.
+for long coding task, use the full effort on writing 1 file and then in next turn write the next file and use chat to say u completed the task.
 
 """""
 

@@ -9,7 +9,7 @@ from prompt_toolkit import PromptSession
 from prompt_toolkit.completion import Completer, Completion
 from prompt_toolkit.formatted_text import HTML
 from prompt_toolkit.history import InMemoryHistory
-
+from ..protocol.registry import get, get_continuity, get_confirmation, exists as protocol_exists
 from ..service.project_map import generate_project_map
 from ..bridge_client import ask_bridge, clear_session
 from ..commands.add import (
@@ -184,12 +184,56 @@ def render_diff(text: str) -> Text:
 
     return rendered
 
+def format_feedback(protocol_name: str, status: str, detail: str = "") -> str:
+    """
+    Uniform envelope for every protocol outcome, so the AI can parse
+    what happened at a glance regardless of protocol. Response-kind
+    OK results carry their own native payload as `detail` (e.g. read's
+    === FILES === blocks); everything else is a short reason.
+    """
+    header = f"[{protocol_name.upper()}:{status}]"
+    if detail:
+        return f"{header}\n{detail}"
+    return header
+
+
+def confirm_action(protocol: dict) -> tuple[bool, str]:
+    """
+    Shows the human what a confirmation-gated protocol is about to do
+    and asks y/n. On decline, also asks for an optional free-text
+    reason. Returns (accepted, reason) — reason is "" when accepted
+    or left blank on decline.
+    """
+    target = protocol.get("target", "")
+    payload = protocol.get("payload", "")
+
+    console.print(
+        Panel(
+            payload if payload else "[dim](no content)[/dim]",
+            title=f"✍️  [yellow]Confirm write → {target}[/yellow]",
+            border_style="yellow",
+        )
+    )
+
+    answer = prompt_session.prompt(
+        HTML(f"<ansiyellow><b>Accept this write to {target}? (y/n)</b></ansiyellow> ")
+    ).strip().lower()
+
+    if answer == "y":
+        return True, ""
+
+    reason = prompt_session.prompt(
+        HTML("<ansiyellow>Reason (optional, Enter to skip)</ansiyellow> ")
+    ).strip()
+
+    return False, reason
 
 def handle_protocol(protocol: dict):
     """
-    Validate, dispatch and display a single parsed protocol.
-    Returns the dispatch result dict (or None if it wasn't dispatched),
-    so callers can inspect "continuity" afterward.
+    Validate, (optionally) confirm, dispatch and display a single
+    parsed protocol. Always returns a result dict with "continuity" —
+    every outcome loops back to the AI except protocols explicitly
+    declared continuity=False (currently only chat/askuser).
     """
 
     name = protocol["protocol"]
@@ -197,28 +241,60 @@ def handle_protocol(protocol: dict):
 
     if not protocol_exists(name):
         print_error("Unknown Protocol", f"'{name}' is not a recognized protocol.")
-        return None
+        return {
+            "protocol": name,
+            "status": "INVALID",
+            "result": format_feedback(
+                name, "INVALID",
+                f"'{name}' is not a recognized protocol. Check the name and try again.",
+            ),
+            "continuity": True,
+        }
 
     if not validate(protocol):
         print_error(
             "Protocol Not Permitted",
             f"'{name}' is not allowed in [bold]{get_mode()}[/bold] mode.",
         )
-        return None
+        return {
+            "protocol": name,
+            "status": "UNAUTHORIZED",
+            "result": format_feedback(
+                name, "UNAUTHORIZED",
+                f"'{name}' exists but is not permitted in {get_mode()} mode.",
+            ),
+            "continuity": True,
+        }
+
+    if get_confirmation(name):
+        accepted, reason = confirm_action(protocol)
+
+        if not accepted:
+            console.print(f"[red]✘ Rejected:[/red] {protocol.get('target', name)}")
+
+            detail_lines = [
+                "User denied.",
+                f"target: {protocol.get('target', '')}",
+            ]
+            if reason:
+                detail_lines.append(f"reason: {reason}")
+
+            return {
+                "protocol": name,
+                "status": "REJECTED",
+                "result": format_feedback(name, "REJECTED", "\n".join(detail_lines)),
+                "continuity": get_continuity(name),
+            }
 
     with console.status(f"[cyan]{ui['status']}[/cyan]", spinner="dots"):
         result = dispatch(protocol)
 
     if result["kind"] == "action":
         console.print(f"[green]✔ Updated:[/green] {result['result']}")
+        feedback = format_feedback(name, "OK", f"Successfully written to {result['result']}")
     else:
         result_text = result["result"]
-
-        body = (
-            render_diff(result_text)
-            if is_diff_like(result_text)
-            else result_text
-        )
+        body = render_diff(result_text) if is_diff_like(result_text) else result_text
 
         console.print(
             Panel(
@@ -227,11 +303,16 @@ def handle_protocol(protocol: dict):
                 border_style="cyan",
             )
         )
+        feedback = format_feedback(name, "OK", result_text)
 
-    return result
+    return {
+        "protocol": name,
+        "status": "OK",
+        "result": feedback,
+        "continuity": result["continuity"],
+    }
 
-
-def run_ai_turn(prompt: str):
+def run_ai_turn(prompt: str, origin: str = "human"):
     """
     Sends `prompt` to the AI (in whatever mode/session is currently
     active), processes every protocol in the response, and — if any
@@ -240,21 +321,42 @@ def run_ai_turn(prompt: str):
     human. Recurses until a turn produces no continuity=True protocols,
     at which point control returns to the human prompt loop.
 
+    `origin` labels *why* this particular turn is happening, purely for
+    console visibility — it has no effect on dispatch logic. "human" is
+    a real person typing; "feedback" is Rig auto-forwarding a protocol
+    result the AI needs to react to; "recovery" is Rig nudging the AI
+    after it failed to produce a usable protocol at all.
+
     Every call — including this recursive follow-up — targets the same
     session_id (the mode active when the turn started), and never
     re-sends the system prompt, since by definition the session was
     already initialized to get here.
     """
-
     session_id = get_mode()
 
-    with console.status("[yellow]Sending to AI Bridge...[/yellow]", spinner="dots"):
+    ORIGIN_UI = {
+        "human":    ("[bold cyan]You → AI[/bold cyan]", "[yellow]Sending to AI Bridge...[/yellow]"),
+        "feedback": ("[bold green]Rig → AI[/bold green] [dim](forwarding protocol result)[/dim]", "[yellow]Sending protocol feedback...[/yellow]"),
+        "recovery": ("[bold yellow]Rig → AI[/bold yellow] [dim](retrying after failure)[/dim]", "[yellow]Asking AI to retry...[/yellow]"),
+    }
+    label, status_msg = ORIGIN_UI.get(origin, ORIGIN_UI["human"])
+    console.print(label)
+
+    with console.status(status_msg, spinner="dots"):
         response = ask_bridge(prompt, session_id=session_id)
 
     protocols = parse_protocols(response)
 
     if not protocols:
         print_error("No Protocol Detected", "The AI response contained no parseable protocol.")
+
+        feedback = format_feedback(
+            "response", "NO_PROTOCOL",
+            "No protocol was detected in your last message. Either you "
+            "didn't emit one, or the parser failed to recognize the format "
+            "you used — check the syntax and try again.",
+        )
+        run_ai_turn(feedback, origin="recovery")
         return
 
     continuity_results = []
@@ -262,15 +364,12 @@ def run_ai_turn(prompt: str):
     for protocol in protocols:
         result = handle_protocol(protocol)
 
-        if result is not None and result.get("continuity"):
-            continuity_results.append(
-                f"[{result['protocol']} result]\n{result['result']}"
-            )
+        if result and result.get("continuity"):
+            continuity_results.append(result["result"])
 
     if continuity_results:
         followup_prompt = "\n\n".join(continuity_results)
-        run_ai_turn(followup_prompt)
-
+        run_ai_turn(followup_prompt, origin="feedback")
 
 def run():
     global pending_context
