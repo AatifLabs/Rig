@@ -4,3 +4,5 @@ uv.lock
 .python-version
 hi.py
 rig.egg-info/
+rig/state.json
+rig/.rig_runtime/

@@ -1,6 +1,28 @@
-import os
-import shutil
-import socket
+"""
+rig-start — pick an account + provider, make sure the bridge is running,
+then tell the bridge (over HTTP) to bring that account's Chrome up and
+land the "code" session on the chosen provider.
+
+BIG CHANGE from the old rig-start: this file used to launch Chrome itself
+(find_chrome(), fixed port 9222, then a raw Playwright connect to click
+page.goto on whatever tab it found). All of that ownership has moved into
+registry.py, which now owns every Chrome process, one per account, on a
+dynamically-allocated port. rig-start's only job now is:
+
+  1. make sure the bridge process (the FastAPI app, fixed port 8080 — an
+     application port, not a Chrome CDP port, so it's fine to keep static)
+     is up
+  2. ask the user which account + provider
+  3. tell the bridge which one via /session/new, so the CHOICE actually
+     reaches the part of the system that drives the browser — the old
+     version's bug (picking a provider that the bridge never learned
+     about) is fixed by construction: there is no other path to a live
+     session except through this call.
+  4. confirm it came up healthy
+
+This intentionally no longer touches Playwright or Chrome directly at all.
+"""
+
 import subprocess
 import sys
 import time
@@ -8,54 +30,25 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-CHROME_PORT = 9222
+from .session_state import set_session
+from .providers import PROVIDER_URLS
+from . import bridge_client
+
 BRIDGE_PORT = 8080
-CHROME_PROFILE = Path.home() / ".chrome-ai-profile"
+PROFILES_DIR = Path(__file__).parent / "profiles"
+RUNTIME_DIR = Path(__file__).parent / ".rig_runtime"
+BRIDGE_PID_FILE = RUNTIME_DIR / "bridge.pid"
+BRIDGE_LOG_FILE = RUNTIME_DIR / "bridge.log"
 
 
-def find_chrome():
-    """
-    Locates the official Google Chrome binary across Windows, macOS, and Linux.
-    Strictly avoids sandboxed variants (like Flatpak/Snap) to ensure CDP works.
-    """
-    if sys.platform == "win32":
-        candidates = [
-            r"C:\Program Files\Google\Chrome\Application\chrome.exe",
-            r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
-            os.path.join(
-                os.environ.get("LOCALAPPDATA", ""),
-                r"Google\Chrome\Application\chrome.exe",
-            ),
-        ]
-        for candidate in candidates:
-            if os.path.exists(candidate):
-                return candidate
-
-    elif sys.platform == "darwin":
-        candidates = [
-            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-        ]
-        for candidate in candidates:
-            if os.path.exists(candidate):
-                return candidate
-
-    else:
-        # Linux
-        candidates = [
-            "google-chrome-stable",
-            "google-chrome",
-            "chrome",
-        ]
-        for candidate in candidates:
-            path = shutil.which(candidate)
-            if path:
-                return path
-
-    return None
+def list_profiles():
+    if not PROFILES_DIR.is_dir():
+        return []
+    return sorted(p.name for p in PROFILES_DIR.iterdir() if p.is_dir())
 
 
 def port_open(port: int) -> bool:
-    """Checks if a given port is currently bound and listening."""
+    import socket
     s = socket.socket()
     try:
         return s.connect_ex(("127.0.0.1", port)) == 0
@@ -63,25 +56,17 @@ def port_open(port: int) -> bool:
         s.close()
 
 
-def wait_for_port(port: int, timeout: int = 10) -> bool:
-    """
-    Polls the port every 0.5 seconds.
-    Returns True instantly when open, False if it times out.
-    """
-    start_time = time.time()
-    while time.time() - start_time < timeout:
+def wait_for_port(port: int, timeout: int = 15) -> bool:
+    start = time.time()
+    while time.time() - start < timeout:
         if port_open(port):
             return True
-        time.sleep(0.5)
+        time.sleep(0.3)
     return False
 
 
 def http_is_healthy(url: str) -> bool:
-    """
-    Performs a Layer 7 HTTP GET request to verify the service is actually responding.
-    """
     try:
-        # 2-second timeout prevents hanging if the port is open but unresponsive
         req = urllib.request.Request(url, method="GET")
         with urllib.request.urlopen(req, timeout=2) as response:
             return response.status == 200
@@ -89,96 +74,106 @@ def http_is_healthy(url: str) -> bool:
         return False
 
 
-def main():
+def choose_profile_and_provider():
+    profiles = list_profiles()
+    if not profiles:
+        print("[-] No profiles found. Run rig-setup first to create one.")
+        sys.exit(1)
 
-    # ==========================================
-    # START CHROME
-    # ==========================================
+    provider_names = list(PROVIDER_URLS.keys())
+    provider_label = ", ".join(provider_names)
 
-    if not port_open(CHROME_PORT):
-        chrome_path = find_chrome()
+    print("\nAvailable profiles:")
+    for i, name in enumerate(profiles, start=1):
+        print(f"  {i}. {name}  ({provider_label})")
 
-        if not chrome_path:
-            print("[-] Error: Google Chrome not found on this system.")
-            sys.exit(1)
+    while True:
+        choice = input(f"\nPick a profile [1-{len(profiles)}]: ").strip()
+        if choice.isdigit() and 1 <= int(choice) <= len(profiles):
+            profile_name = profiles[int(choice) - 1]
+            break
+        print("Invalid choice, try again.")
 
-        print(f"[+] Starting AI Chrome ({chrome_path})...")
+    print(f"\nProviders for '{profile_name}':")
+    for i, name in enumerate(provider_names, start=1):
+        print(f"  {i}. {name}")
 
-        subprocess.Popen(
-            [
-                chrome_path,
-                f"--remote-debugging-port={CHROME_PORT}",
-                f"--user-data-dir={CHROME_PROFILE}",
-                "--window-size=1920,1080",
-                "--new-window",
-                "--disable-session-crashed-bubble",
-            ],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
+    while True:
+        choice = input(f"Pick a provider [1-{len(provider_names)}]: ").strip()
+        if choice.isdigit() and 1 <= int(choice) <= len(provider_names):
+            provider_name = provider_names[int(choice) - 1]
+            break
+        print("Invalid choice, try again.")
 
-        print("[+] Waiting for Chrome to expose CDP port...")
-        if not wait_for_port(CHROME_PORT, timeout=10):
-            print(
-                "[-] Error: Chrome failed to start or expose port 9222 within 10 seconds."
-            )
-            sys.exit(1)
+    return profile_name, provider_name
 
-        print("[+] Chrome CDP is ready.")
 
-    else:
-        print("[+] Chrome already running.")
-
-    # ==========================================
-    # START BRIDGE
-    # ==========================================
-
-    if not port_open(BRIDGE_PORT):
-        print("[+] Starting bridge server...")
-
-        subprocess.Popen(
-            [
-                sys.executable,
-                "-m",
-                "rig.bridge",
-            ],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-
-        print("[+] Waiting for Bridge server to initialize...")
-        if not wait_for_port(BRIDGE_PORT, timeout=10):
-            print("[-] Error: Bridge server failed to start on port 8080.")
-            sys.exit(1)
-
-    else:
+def ensure_bridge_running():
+    if port_open(BRIDGE_PORT):
         print("[+] Bridge already running.")
+        return
 
-    # ==========================================
-    # HEALTH CHECK
-    # ==========================================
+    print("[+] Starting bridge server...")
+    RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+    log_file = open(BRIDGE_LOG_FILE, "a")
 
-    print("[+] Running final application health checks...")
+    # Detached from this terminal so the bridge keeps running after
+    # rig-start exits; output goes to bridge.log instead of the terminal.
+    popen_kwargs = {"stdout": log_file, "stderr": subprocess.STDOUT, "stdin": subprocess.DEVNULL}
+    if sys.platform == "win32":
+        popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+    else:
+        popen_kwargs["start_new_session"] = True
 
-    # 1. Check if Chrome CDP is actually responding to HTTP requests
-    chrome_healthy = http_is_healthy(f"http://127.0.0.1:{CHROME_PORT}/json/version")
+    bridge_process = subprocess.Popen(
+        [sys.executable, "-u", "-m", "rig.bridge"], **popen_kwargs
+    )
+    BRIDGE_PID_FILE.write_text(str(bridge_process.pid))
 
-    # 2. Check if the Bridge API is responding (Requires @app.get("/health") in rig.bridge)
-    bridge_healthy = http_is_healthy(f"http://127.0.0.1:{BRIDGE_PORT}/health")
+    print("[+] Waiting for Bridge server to initialize...")
+    if not wait_for_port(BRIDGE_PORT, timeout=15):
+        print("[-] Error: Bridge server failed to start on port 8080.")
+        print(f"Bridge exited with code: {bridge_process.poll()}")
+        print(f"See the log: {BRIDGE_LOG_FILE}")
+        sys.exit(1)
+    print(f"[+] Bridge running (pid {bridge_process.pid}), log: {BRIDGE_LOG_FILE}")
 
-    if chrome_healthy and bridge_healthy:
+    # The FastAPI process is up, but /health only becomes meaningful once an
+    # account exists — that happens via the /session/new call below, which
+    # is what actually triggers registry.py to launch this account's Chrome.
+    deadline = time.time() + 15
+    while time.time() < deadline:
+        if http_is_healthy(f"http://127.0.0.1:{BRIDGE_PORT}/health"):
+            return
+        time.sleep(0.3)
+    print("[-] Error: Bridge API on port 8080 never became responsive.")
+    sys.exit(1)
+
+
+def main():
+    profile_name, provider_name = choose_profile_and_provider()
+    set_session("code", profile_name, provider_name)
+
+    ensure_bridge_running()
+
+    print(f"[+] Bringing up account '{profile_name}' on provider '{provider_name}'...")
+    ok = bridge_client.clear_session(
+        session_id="code", account=profile_name, provider=provider_name, timeout=60.0
+    )
+    if not ok:
+        print("[-] Bridge failed to bring up the session. Check the bridge process's logs.")
+        sys.exit(1)
+
+    if not bridge_client.is_bridge_healthy(account=profile_name, session_id="code", timeout=10.0):
+        print("[-] Session came up but health check did not report ready. "
+              "It may still be loading — check the Chrome window the bridge opened.")
+    else:
         print("")
         print("======================================")
         print("AI BRIDGE READY")
+        print(f"account={profile_name} provider={provider_name}")
         print("======================================")
         print("")
-    else:
-        print("[-] Bridge health check failed.")
-        if not chrome_healthy:
-            print(f"    -> Chrome CDP on port {CHROME_PORT} is unresponsive.")
-        if not bridge_healthy:
-            print(f"    -> Bridge API on port {BRIDGE_PORT} is unresponsive.")
-        sys.exit(1)
 
 
 if __name__ == "__main__":

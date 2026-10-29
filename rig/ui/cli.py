@@ -11,7 +11,9 @@ from prompt_toolkit.formatted_text import HTML
 from prompt_toolkit.history import InMemoryHistory
 from ..protocol.registry import get, get_continuity, get_confirmation, exists as protocol_exists
 from ..service.project_map import generate_project_map
-from ..bridge_client import ask_bridge, clear_session
+from ..bridge_client import ask_bridge, clear_session, switch_provider
+from ..session_state import get_session as get_stored_session
+from ..providers import PROVIDER_URLS
 from ..commands.add import (
     add_all,
     add_file,
@@ -40,7 +42,7 @@ console = Console()
 attached_files = []
 pending_context = None
 
-VERSION = "1.2"
+VERSION = "1.4.0"
 
 # Tracks whether each mode's session has already received its system
 # prompt. "code" starts True because bridge.py eagerly creates and the
@@ -52,6 +54,27 @@ sessions_initialized = {
     "ask": False,
 }
 
+# Per-mode account/provider pointer. "code"'s starting value is whatever
+# rig-start last wrote to state.json (it calls set_session("code", ...)
+# right before handing off to the bridge). "ask" has no fixed default of
+# its own — it's None until first used, at which point it copies "code"'s
+# CURRENT pointer (see get_mode_pointer below), matching the rest of Rig's
+# lazy-session-creation behavior.
+_stored_code = get_stored_session("code")
+mode_pointer = {
+    "code": {
+        "account": _stored_code["profile"] if _stored_code else None,
+        "provider": _stored_code["provider"] if _stored_code else None,
+    },
+    "ask": None,
+}
+
+
+def get_mode_pointer(session_id: str) -> dict:
+    if mode_pointer.get(session_id) is None:
+        mode_pointer[session_id] = dict(mode_pointer["code"])
+    return mode_pointer[session_id]
+
 # --------------------
 # Command metadata — single source of truth for /help and autocomplete
 # --------------------
@@ -60,6 +83,7 @@ COMMANDS = [
     ("/ask", "Switch to Ask mode (read-only session)"),
     ("/code", "Switch to Code mode (file writes allowed)"),
     ("/clear", "Reset the current mode's AI session"),
+    ("/use", "Switch account/provider for the current mode — /use <account> <provider>"),
     ("/add", "Attach a file to context — /add <filename>"),
     ("/add all", "Attach every discoverable file to context"),
     ("/files", "List currently attached files"),
@@ -312,7 +336,10 @@ def handle_protocol(protocol: dict):
         "continuity": result["continuity"],
     }
 
-def run_ai_turn(prompt: str, origin: str = "human"):
+MAX_RECOVERY_RETRIES = 3
+
+
+def run_ai_turn(prompt: str, origin: str = "human", retries: int = 0):
     """
     Sends `prompt` to the AI (in whatever mode/session is currently
     active), processes every protocol in the response, and — if any
@@ -333,6 +360,15 @@ def run_ai_turn(prompt: str, origin: str = "human"):
     already initialized to get here.
     """
     session_id = get_mode()
+    pointer = get_mode_pointer(session_id)
+
+    if not pointer["account"] or not pointer["provider"]:
+        print_error(
+            "No Account/Provider Set",
+            f"'{session_id}' mode has no account/provider yet. Run rig-start "
+            "first, or use /use <account> <provider>.",
+        )
+        return
 
     ORIGIN_UI = {
         "human":    ("[bold cyan]You → AI[/bold cyan]", "[yellow]Sending to AI Bridge...[/yellow]"),
@@ -343,12 +379,25 @@ def run_ai_turn(prompt: str, origin: str = "human"):
     console.print(label)
 
     with console.status(status_msg, spinner="dots"):
-        response = ask_bridge(prompt, session_id=session_id)
+        response = ask_bridge(
+            prompt,
+            session_id=session_id,
+            account=pointer["account"],
+            provider=pointer["provider"],
+        )
 
     protocols = parse_protocols(response)
 
     if not protocols:
         print_error("No Protocol Detected", "The AI response contained no parseable protocol.")
+
+        if retries >= MAX_RECOVERY_RETRIES:
+            print_error(
+                "Giving Up",
+                f"No usable reply after {MAX_RECOVERY_RETRIES} retries. "
+                "Try rephrasing, or /clear to start a fresh session.",
+            )
+            return
 
         feedback = format_feedback(
             "response", "NO_PROTOCOL",
@@ -356,7 +405,7 @@ def run_ai_turn(prompt: str, origin: str = "human"):
             "didn't emit one, or the parser failed to recognize the format "
             "you used — check the syntax and try again.",
         )
-        run_ai_turn(feedback, origin="recovery")
+        run_ai_turn(feedback, origin="recovery", retries=retries + 1)
         return
 
     continuity_results = []
@@ -430,9 +479,22 @@ def run():
 
             if user_input == "/clear":
                 session_id = get_mode()
+                pointer = get_mode_pointer(session_id)
+
+                if not pointer["account"] or not pointer["provider"]:
+                    print_error(
+                        "No Account/Provider Set",
+                        f"'{session_id}' mode has no account/provider yet. Run "
+                        "rig-start first, or use /use <account> <provider>.",
+                    )
+                    continue
 
                 with console.status(f"[yellow]Clearing {session_id} session...[/yellow]", spinner="dots"):
-                    ok = clear_session(session_id=session_id)
+                    ok = clear_session(
+                        session_id=session_id,
+                        account=pointer["account"],
+                        provider=pointer["provider"],
+                    )
 
                 if ok:
                     sessions_initialized[session_id] = False
@@ -442,6 +504,56 @@ def run():
                         "Session Clear Failed",
                         "Could not clear the session — the bridge may be unreachable.",
                     )
+
+                continue
+
+            # --------------------
+            # /use <account> <provider>
+            # --------------------
+            # Scoped to the CURRENT mode only (matches /clear's scoping).
+            # Same account, different provider -> reuse the existing tab,
+            # just navigate it (bridge's /session/use). Different account
+            # -> no bridge call needed here; the next ask_bridge turn will
+            # lazily bring that account's Chrome + tab up on its own,
+            # since sessions are namespaced per-account on the bridge side.
+
+            if user_input == "/use" or user_input.startswith("/use "):
+                parts = user_input.split()
+
+                if len(parts) != 3:
+                    print_error("Usage", "/use <account> <provider>")
+                    continue
+
+                _, account, provider = parts
+
+                if provider not in PROVIDER_URLS:
+                    print_error(
+                        "Unknown Provider",
+                        f"'{provider}' — known providers: {', '.join(PROVIDER_URLS)}",
+                    )
+                    continue
+
+                session_id = get_mode()
+                pointer = get_mode_pointer(session_id)
+                same_account = pointer["account"] == account
+
+                if same_account and pointer["provider"] != provider:
+                    with console.status(
+                        f"[yellow]Switching {session_id} to {provider}...[/yellow]", spinner="dots"
+                    ):
+                        ok = switch_provider(session_id=session_id, account=account, provider=provider)
+
+                    if not ok:
+                        print_error(
+                            "Switch Failed",
+                            "Could not switch provider — the bridge may be unreachable.",
+                        )
+                        continue
+
+                pointer["account"] = account
+                pointer["provider"] = provider
+                sessions_initialized[session_id] = False
+                console.print(f"[green]✔ {session_id} now pointed at {account}/{provider}.[/green]")
 
                 continue
 
@@ -596,8 +708,22 @@ def run():
 
             project_files = read_attached_files(attached_files) if attached_files else []
 
+            # get_prompt() now needs to know WHICH provider's prompt to
+            # resolve (gpt.py and claude.py each carry their own
+            # SYSTEM_PROMPT_ASK/CODE) — this is the current mode's
+            # pointer, same one run_ai_turn/ask_bridge already use.
+            pointer = get_mode_pointer(session_id)
+
+            if not pointer["account"] or not pointer["provider"]:
+                print_error(
+                    "No Account/Provider Set",
+                    f"'{session_id}' mode has no account/provider yet. Run rig-start "
+                    "first, or use /use <account> <provider>.",
+                )
+                continue
+
             prompt = build_prompt(
-                get_prompt(),
+                get_prompt(pointer["provider"]),
                 user_input,
                 project_files,
                 include_system_prompt=include_system_prompt,
